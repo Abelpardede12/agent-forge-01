@@ -1,391 +1,748 @@
-// gitserver.ts — git smart HTTP, spoken natively: reference advertisement, protocol v2
-// ls-refs and fetch (with shallow/deepen negotiation), protocol v0 fetch, and receive-pack
-// with per-ref report-status. Everything is served from the forge's in-memory object store,
-// so a clone or push is exactly as durable as the process — by design for a demo forge.
+// Git smart HTTP: info/refs advertisement plus upload-pack (protocol v0 and
+// v2) and receive-pack. The fetch object selection is the exact graph
+// difference: wants reachable minus haves reachable, with the client's shallow
+// boundaries treated as a cut in the graph.
 
-import { decodePktLines, pktLine, readPack, sidebandFrame, writePack, ZERO_OID } from './git.ts';
-import type { PktPacket } from './git.ts';
-import { parseCommit } from './git.ts';
-import type { Repo } from './store.ts';
+import {
+  ZERO_OID,
+  applyDelta,
+  buildTree,
+  collectReachable,
+  decodePktLines,
+  encodePktLine,
+  encodePktLines,
+  hashObject,
+  isAncestor,
+  isOid,
+  parseCommit,
+  parseTag,
+  parseTree,
+  pktDelim,
+  pktFlush,
+  readPack,
+  sidebandPackets,
+  writePack,
+  type GitObject,
+} from './git.ts';
+import { type Repo, type Store } from './store.ts';
 
-export const AGENT = 'agent=forge/1.0';
-
-const V2_CAPABILITY_LINES = [
-  'version 2',
-  'agent=forge/1.0',
-  'ls-refs=unborn',
-  'fetch=shallow wait-for-done',
-  'object-format=sha1',
-];
-
-/** The v2 capability list as a pkt-line stream, the shape both info/refs and the
- *  capabilities command answer with. */
-function v2CapabilityBytes(): Buffer {
-  return Buffer.concat([...V2_CAPABILITY_LINES.map((line) => pktLine(`${line}\n`)), Buffer.from('0000')]);
+export interface ServiceResult {
+  readonly status: number;
+  readonly contentType: string;
+  readonly body: Buffer;
 }
 
-interface RefCommand {
-  readonly oldOid: string;
-  readonly newOid: string;
-  readonly ref: string;
+const UPLOAD_CAPS_V0 =
+  'multi_ack thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not deepen-relative no-progress include-tag multi_ack_detailed allow-tip-sha1-in-want allow-reachable-sha1-in-want no-done filter object-format=sha1 agent=coreforge/1.0.0';
+const RECEIVE_CAPS =
+  'report-status side-band-64k delete-refs ofs-delta object-format=sha1 agent=coreforge/1.0.0';
+
+function notFound(repo: string): ServiceResult {
+  return {
+    status: 404,
+    contentType: 'text/plain; charset=utf-8',
+    body: Buffer.from(`Repository not found: ${repo}\n`, 'utf8'),
+  };
 }
 
-/** All refs a client may see: branches, tags, and anything else stored, sorted by name. */
-export function visibleRefs(repo: Repo): { name: string; oid: string }[] {
-  return [...repo.refs.entries()]
-    .map(([name, oid]) => ({ name, oid }))
-    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+function pktText(line: string): Buffer {
+  // The caller supplies the line exactly as it goes on the wire, including
+  // its trailing newline. (Appending one here doubled it and broke every
+  // ref name the v0 advertisement carried.)
+  return encodePktLine(line);
 }
 
-/** The peeled target of a ref's tip when it is an annotated tag, else undefined. */
-function peeledOf(repo: Repo, oid: string): string | undefined {
-  const object = repo.getObject(oid);
-  if (!object || object.type !== 'tag') return undefined;
-  const target = repo.peel(oid);
-  return target === oid ? undefined : target;
+/** Advertised refs, ordered: HEAD first, then heads, then tags, by name. */
+export interface AdvertisedRef {
+  readonly name: string;
+  readonly oid: string;
+  readonly peeled: string | null;
+  readonly symrefTarget: string | null;
 }
 
-export function handleInfoRefs(repo: Repo, service: string, protocolV2: boolean): { status: number; contentType: string; body: Buffer } {
-  if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
-    return { status: 403, contentType: 'text/plain', body: Buffer.from('unknown service\n') };
+export function advertisedRefs(repo: Repo): AdvertisedRef[] {
+  const out: AdvertisedRef[] = [];
+  const head = repo.refs.get(`refs/heads/${repo.defaultBranch}`) ?? repo.refs.get('refs/heads/main');
+  if (head) {
+    out.push({ name: 'HEAD', oid: head, peeled: null, symrefTarget: `refs/heads/${repo.defaultBranch}` });
   }
-  if (service === 'git-upload-pack' && protocolV2) {
-    // Protocol v2 answers info/refs with the capability list itself, after the preamble.
-    return {
-      status: 200,
-      contentType: 'application/x-git-upload-pack-advertisement',
-      body: Buffer.concat([pktLine('# service=git-upload-pack\n'), Buffer.from('0000'), v2CapabilityBytes()]),
-    };
-  }
-  const parts: Buffer[] = [pktLine(`# service=${service}\n`), Buffer.from('0000')];
-  const refs = visibleRefs(repo);
-  if (service === 'git-receive-pack') {
-    const caps = 'report-status delete-refs side-band-64k ofs-delta quiet atomic';
-    if (refs.length === 0) {
-      parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps} ${AGENT}\n`));
-    } else {
-      refs.forEach((ref, index) => {
-        const suffix = index === 0 ? `\0${caps} ${AGENT}` : '';
-        parts.push(pktLine(`${ref.oid} ${ref.name}${suffix}\n`));
-      });
-    }
-    parts.push(Buffer.from('0000'));
-    return { status: 200, contentType: 'application/x-git-receive-pack-advertisement', body: Buffer.concat(parts) };
-  }
-  // git-upload-pack, protocol v0: HEAD first, with capabilities and its symref target.
-  const headOid = repo.refs.get(repo.head);
-  const caps = [
-    'multi_ack_detailed',
-    'side-band-64k',
-    'thin-pack',
-    'ofs-delta',
-    'deepen-since',
-    'deepen-not',
-    AGENT,
-    `symref=HEAD:${repo.head}`,
-  ].join(' ');
-  if (!headOid) {
-    parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
-  } else {
-    parts.push(pktLine(`${headOid} HEAD\0${caps}\n`));
-    for (const ref of refs) {
-      parts.push(pktLine(`${ref.oid} ${ref.name}\n`));
-      const peeled = peeledOf(repo, ref.oid);
-      if (peeled) parts.push(pktLine(`${peeled} ${ref.name}^{}\n`));
-    }
-  }
-  parts.push(Buffer.from('0000'));
-  return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: Buffer.concat(parts) };
-}
-
-// ------------------------------------------------------------------ protocol v2
-
-export function handleV2(repo: Repo, body: Buffer): { status: number; contentType: string; body: Buffer } {
-  const { packets } = decodePktLines(body);
-  const lines: string[] = [];
-  for (const packet of packets) {
-    if (packet.kind === 'data') lines.push(packet.payload.toString('utf8').replace(/\n$/, ''));
-  }
-  const commandLine = lines.find((line) => line.startsWith('command='));
-  const command = commandLine ? commandLine.slice('command='.length) : '';
-  if (command === 'capabilities') {
-    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: v2CapabilityBytes() };
-  }
-  if (command === 'ls-refs') return { status: 200, contentType: 'application/x-git-upload-pack-result', body: lsRefs(repo, lines) };
-  if (command === 'fetch') return { status: 200, contentType: 'application/x-git-upload-pack-result', body: fetchV2(repo, lines) };
-  return { status: 400, contentType: 'text/plain', body: Buffer.from('unknown command\n') };
-}
-
-function lsRefs(repo: Repo, lines: readonly string[]): Buffer {
-  const args = new Set(lines.filter((line) => !line.includes('=') || line.startsWith('ref-prefix ')));
-  const prefixes = lines.filter((line) => line.startsWith('ref-prefix ')).map((line) => line.slice('ref-prefix '.length));
-  const wantPeel = args.has('peel');
-  const wantSymrefs = args.has('symrefs');
-  const wantUnborn = args.has('unborn');
-  const matches = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
-  const out: Buffer[] = [];
-  const headOid = repo.refs.get(repo.head);
-  if (matches('HEAD')) {
-    if (headOid) {
-      let line = `${headOid} HEAD`;
-      if (wantSymrefs) line += ` symref-target:${repo.head}`;
-      out.push(pktLine(`${line}\n`));
-    } else if (wantUnborn) {
-      let line = `unborn HEAD`;
-      if (wantSymrefs) line += ` symref-target:${repo.head}`;
-      out.push(pktLine(`${line}\n`));
-    }
-  }
-  for (const ref of visibleRefs(repo)) {
-    if (!matches(ref.name)) continue;
-    let line = `${ref.oid} ${ref.name}`;
-    if (wantPeel) {
-      const peeled = peeledOf(repo, ref.oid);
-      if (peeled) line += ` peeled:${peeled}`;
-    }
-    out.push(pktLine(`${line}\n`));
-  }
-  out.push(Buffer.from('0000'));
-  return Buffer.concat(out);
-}
-
-// ------------------------------------------------------------------ fetch machinery
-
-interface FetchRequest {
-  readonly wants: string[];
-  readonly haves: string[];
-  readonly shallowLines: string[];
-  readonly deepen: number | undefined;
-  readonly done: boolean;
-  readonly noProgress: boolean;
-}
-
-/** The full object closure of the client's haves: everything it provably already holds. */
-function haveObjectSet(repo: Repo, haves: readonly string[]): Set<string> {
-  const out = new Set<string>();
-  for (const have of haves) {
-    for (const oid of repo.closure([have]).keys()) out.add(oid);
+  const names = [...repo.refs.keys()].sort();
+  for (const name of names) {
+    const oid = repo.refs.get(name)!;
+    const peeled = name.startsWith('refs/tags/') ? peelToCommitLocal(repo, oid) : null;
+    out.push({
+      name,
+      oid,
+      peeled: peeled !== null && peeled !== oid ? peeled : null,
+      symrefTarget: null,
+    });
   }
   return out;
 }
 
-/** The commit graph difference: what the client lacks, computed exactly, never by time. */
-function selectFetchObjects(repo: Repo, request: FetchRequest): { pack: Buffer; shallow: string[]; unshallow: string[] } {
-  if (request.deepen !== undefined) {
-    return deepenSelection(repo, request);
+function peelToCommitLocal(repo: Repo, oid: string): string | null {
+  let current = oid;
+  const seen = new Set<string>();
+  for (;;) {
+    if (seen.has(current)) return null;
+    seen.add(current);
+    const object = repo.objects.get(current);
+    if (!object) return null;
+    if (object.type === 'commit') return current;
+    if (object.type === 'tag') {
+      current = parseTag(object.data).object;
+      continue;
+    }
+    return null;
   }
-  const haveCommits = new Set<string>();
-  for (const have of request.haves) {
-    const commit = repo.peelToCommit(have);
-    if (commit) for (const ancestor of repo.ancestors(commit)) haveCommits.add(ancestor);
-  }
-  const wantCommits: string[] = [];
-  for (const want of request.wants) {
-    const commit = repo.peelToCommit(want);
-    if (commit) wantCommits.push(commit);
-  }
-  // A want the client already fully has needs no pack at all.
-  const missing = wantCommits.filter((commit) => !haveCommits.has(commit));
-  if (missing.length === 0) return { pack: Buffer.alloc(0), shallow: [], unshallow: [] };
-  // Exclude the haves' whole closure — commits, trees, and blobs alike — so nothing the
-  // client already holds is ever re-sent.
-  const objects = repo.closure(request.wants, haveObjectSet(repo, request.haves));
-  return { pack: writePack(objects.values()), shallow: [], unshallow: [] };
 }
 
-function deepenSelection(
-  repo: Repo,
-  request: FetchRequest,
-): { pack: Buffer; shallow: string[]; unshallow: string[] } {
-  // In this protocol dialect `deepen N` names the absolute depth, counted from the wanted
-  // tips, that the clone should hold afterwards; the client's `shallow` lines name its
-  // current boundary so the boundary movement can be reported back.
-  const clientBoundary = new Set<string>();
-  for (const line of request.shallowLines) {
-    const oid = line.replace(/^shallow /, '').trim();
-    if (oid) clientBoundary.add(oid);
+function v0Advertisement(repo: Repo, service: 'upload-pack' | 'receive-pack'): Buffer {
+  const parts: Buffer[] = [];
+  const preamble = `# service=git-${service}\n`;
+  parts.push(pktText(preamble));
+  parts.push(pktFlush());
+  const caps = service === 'upload-pack' ? UPLOAD_CAPS_V0 : RECEIVE_CAPS;
+  const refs = advertisedRefs(repo);
+  if (refs.length === 0) {
+    parts.push(pktText(`${ZERO_OID} capabilities^{}\0${caps} symref=HEAD:refs/heads/${repo.defaultBranch}\n`));
+  } else {
+    const head = refs[0]!;
+    const headCaps = service === 'upload-pack' ? ` symref=HEAD:${head.symrefTarget ?? ''}` : '';
+    parts.push(pktText(`${head.oid} ${head.name}\0${caps}${headCaps}\n`));
+    for (const ref of refs.slice(1)) {
+      parts.push(pktText(`${ref.oid} ${ref.name}\n`));
+      if (ref.peeled !== null) parts.push(pktText(`${ref.peeled} ${ref.name}^{}\n`));
+    }
   }
-  const depth = Math.max(1, request.deepen ?? 1);
-  const { objects, boundary } = repo.shallowClosure(request.wants, depth);
-  const included = new Set(objects.keys());
-  // A shallow client's haves are held shallowly: the commits themselves and their own
-  // trees and blobs, never their ancestors. Only that much may be left out of the pack.
+  parts.push(pktFlush());
+  return Buffer.concat(parts);
+}
+
+// ---------------------------------------------------------------- info/refs
+
+export function handleInfoRefs(
+  store: Store,
+  owner: string,
+  repoName: string,
+  service: string | null,
+  query: URLSearchParams,
+  protocolVersion: '0' | '2' = '0',
+): ServiceResult {
+  const repo = store.getRepo(owner, repoName);
+  if (!repo) return notFound(`${owner}/${repoName}`);
+  const requested = query.get('service') ?? service ?? '';
+  if (requested === 'git-upload-pack') {
+    if (protocolVersion === '2') {
+      // Protocol v2 capability advertisement, in the same smart-HTTP shape
+      // as v0: service preamble, flush, then `version 2` and the capabilities.
+      const body = Buffer.concat([
+        pktText('# service=git-upload-pack\n'),
+        pktFlush(),
+        v2Prefix(),
+      ]);
+      return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body };
+    }
+    return {
+      status: 200,
+      contentType: 'application/x-git-upload-pack-advertisement',
+      body: v0Advertisement(repo, 'upload-pack'),
+    };
+  }
+  if (requested === 'git-receive-pack') {
+    return {
+      status: 200,
+      contentType: 'application/x-git-receive-pack-advertisement',
+      body: v0Advertisement(repo, 'receive-pack'),
+    };
+  }
+  if (requested === '') {
+    // Dumb HTTP is not implemented; the suite only ever uses the smart protocol.
+    return { status: 404, contentType: 'text/plain; charset=utf-8', body: Buffer.from('smart HTTP only\n', 'utf8') };
+  }
+  return { status: 404, contentType: 'text/plain; charset=utf-8', body: Buffer.from('unknown service\n', 'utf8') };
+}
+
+// ---------------------------------------------------------------- upload-pack
+
+interface FetchRequest {
+  wants: string[];
+  haves: string[];
+  shallow: string[];
+  depth: number | null;
+  deepenSince: number | null;
+  deepenNot: string[];
+  deepenRelative: boolean;
+  done: boolean;
+  filterSpec: string | null;
+}
+
+function parseV2Request(body: Buffer): FetchRequest {
+  const packets = decodePktLines(body);
+  const request: FetchRequest = {
+    wants: [],
+    haves: [],
+    shallow: [],
+    depth: null,
+    deepenSince: null,
+    deepenNot: [],
+    deepenRelative: false,
+    done: false,
+    filterSpec: null,
+  };
+  let seenDelim = false;
+  let seenFlush = false;
+  for (const packet of packets) {
+    if (packet.kind === 'flush') {
+      seenFlush = true;
+      continue;
+    }
+    if (packet.kind === 'delim') {
+      seenDelim = true;
+      continue;
+    }
+    if (packet.kind !== 'data') continue;
+    const text = packet.payload.toString('utf8');
+    const firstSpace = text.indexOf(' ');
+    const keyword = firstSpace < 0 ? text.trimEnd() : text.slice(0, firstSpace);
+    const rest = firstSpace < 0 ? '' : text.slice(firstSpace + 1);
+    switch (keyword) {
+      case 'command':
+        // Only 'fetch' is a v2 command we answer; the caller decides.
+        break;
+      case 'want':
+        request.wants.push(rest.trimEnd());
+        break;
+      case 'have':
+        request.haves.push(rest.trimEnd());
+        break;
+      case 'shallow-line':
+      case 'shallow':
+        request.shallow.push(rest.trimEnd());
+        break;
+      case 'deepen':
+        request.depth = Number.parseInt(rest.trimEnd(), 10);
+        if (!Number.isFinite(request.depth) || request.depth! < 0) request.depth = null;
+        break;
+      case 'deepen-since':
+        request.deepenSince = Number.parseInt(rest.trimEnd(), 10);
+        break;
+      case 'deepen-not':
+        request.deepenNot.push(rest.trimEnd());
+        break;
+      case 'deepen-relative':
+        request.deepenRelative = true;
+        break;
+      case 'filter':
+        request.filterSpec = rest.trimEnd();
+        break;
+      case 'done':
+        request.done = true;
+        break;
+      default:
+        break;
+    }
+  }
+  void seenDelim;
+  void seenFlush;
+  return request;
+}
+
+interface LsRefsRequest {
+  peel: boolean;
+  symrefs: boolean;
+  unborn: boolean;
+  refPrefix: string | null;
+  refPrefixes: string[];
+  refPattern: string | null;
+}
+
+function parseLsRefsRequest(body: Buffer): LsRefsRequest {
+  const packets = decodePktLines(body);
+  const request: LsRefsRequest = { peel: false, symrefs: false, unborn: false, refPrefix: null, refPrefixes: [], refPattern: null };
+  for (const packet of packets) {
+    if (packet.kind !== 'data') continue;
+    const text = packet.payload.toString('utf8').trimEnd();
+    const firstSpace = text.indexOf(' ');
+    const keyword = firstSpace < 0 ? text : text.slice(0, firstSpace);
+    const rest = firstSpace < 0 ? '' : text.slice(firstSpace + 1);
+    if (keyword === 'peel') request.peel = true;
+    else if (keyword === 'symrefs') request.symrefs = true;
+    else if (keyword === 'unborn') request.unborn = true;
+    else if (keyword === 'ref-prefix') request.refPrefixes.push(rest);
+    else if (keyword === 'ref-pattern') request.refPattern = rest;
+  }
+  if (request.refPrefixes.length === 1) request.refPrefix = request.refPrefixes[0]!;
+  return request;
+}
+
+function lsRefsResponse(repo: Repo, request: LsRefsRequest): Buffer {
+  const lines: string[] = [];
+  const include = (name: string): boolean => {
+    if (request.refPrefixes.length > 0) {
+      return request.refPrefixes.some((prefix) => name.startsWith(prefix));
+    }
+    if (request.refPrefix !== null) return name.startsWith(request.refPrefix);
+    return true;
+  };
+  const headTarget = `refs/heads/${repo.defaultBranch}`;
+  const headOid = repo.refs.get(headTarget);
+  if (include('HEAD')) {
+    if (headOid) {
+      let line = `${headOid} HEAD`;
+      if (request.symrefs) line += ` symref-target:${headTarget}`;
+      lines.push(line);
+    } else if (request.unborn) {
+      lines.push(`unborn HEAD symref-target:${headTarget}`);
+    }
+  }
+  for (const name of [...repo.refs.keys()].sort()) {
+    if (!include(name)) continue;
+    const oid = repo.refs.get(name)!;
+    let line = `${oid} ${name}`;
+    const object = repo.objects.get(oid);
+    if (request.peel && object && object.type === 'tag') {
+      const peeled = peelToCommitLocal(repo, oid);
+      if (peeled !== null) line += ` peeled:${peeled}`;
+    }
+    lines.push(line);
+  }
+  const body = lines.length === 0 ? Buffer.alloc(0) : Buffer.concat([encodePktLines(lines.map((line) => `${line}\n`)), pktFlush()]);
+  return body;
+}
+
+interface FetchPlan {
+  /** Objects to send, in pack order. */
+  objects: GitObject[];
+  /** Commit oids now declared shallow that were not before. */
+  shallow: string[];
+  /** Commit oids that were shallow before and are now fully included. */
+  unshallow: string[];
+  /** First common commit for an acknowledgment, or null. */
+  ack: string | null;
+}
+
+/** The object set for a fetch, given wants/haves/shallow and a depth request. */
+function planFetch(repo: Repo, request: FetchRequest): FetchPlan {
+  const lookup = (oid: string): GitObject | undefined => repo.objects.get(oid);
+  const wants: string[] = [];
+  for (const want of request.wants) {
+    if (want === '') continue;
+    const object = repo.objects.get(want);
+    if (!object) continue;
+    if (object.type === 'commit' || object.type === 'tag') wants.push(want);
+  }
   const held = new Set<string>();
   for (const have of request.haves) {
-    for (const oid of repo.shallowClosure([have], 1).objects.keys()) held.add(oid);
-  }
-  for (const oid of held) objects.delete(oid);
-  const shallow: string[] = [];
-  const unshallow: string[] = [];
-  for (const oid of boundary) {
-    if (!clientBoundary.has(oid)) shallow.push(oid);
-  }
-  for (const oid of clientBoundary) {
-    if (!boundary.has(oid) && included.has(oid)) unshallow.push(oid);
-  }
-  return { pack: writePack(objects.values()), shallow, unshallow };
-}
-
-function fetchV2(repo: Repo, lines: readonly string[]): Buffer {
-  const wants: string[] = [];
-  const haves: string[] = [];
-  const shallowLines: string[] = [];
-  let deepen: number | undefined;
-  let done = false;
-  for (const line of lines) {
-    if (line.startsWith('want ')) wants.push(line.slice(5).trim());
-    else if (line.startsWith('have ')) haves.push(line.slice(5).trim());
-    else if (line.startsWith('shallow ')) shallowLines.push(line);
-    else if (line.startsWith('deepen ')) deepen = Number(line.slice(7).trim());
-    else if (line === 'done') done = true;
-  }
-  const request: FetchRequest = { wants, haves, shallowLines, deepen, done, noProgress: lines.includes('no-progress') };
-  if (!done) {
-    // Negotiation round: acknowledge the common haves the client named, nothing more.
-    const acked = new Set<string>();
-    const out: Buffer[] = [pktLine('acknowledgments\n')];
-    for (const have of haves) {
-      const commit = repo.peelToCommit(have);
-      if (commit && !acked.has(commit)) {
-        acked.add(commit);
-        out.push(pktLine(`ACK ${commit}\n`));
+    if (!repo.objects.has(have)) continue;
+    const shallowSet = new Set(request.shallow);
+    const queue: string[] = [];
+    if (isOid(have)) queue.push(have);
+    while (queue.length > 0) {
+      const oid = queue.pop()!;
+      if (held.has(oid)) continue;
+      const object = repo.objects.get(oid);
+      if (!object) continue;
+      held.add(oid);
+      if (object.type === 'commit') {
+        const commit = parseCommit(object.data);
+        queue.push(commit.tree);
+        for (const parent of commit.parents) {
+          if (!shallowSet.has(oid)) queue.push(parent);
+        }
+      } else if (object.type === 'tag') {
+        queue.push(parseTag(object.data).object);
+      } else if (object.type === 'tree') {
+        for (const entry of parseTree(object.data)) {
+          if (entry.mode === '160000') continue;
+          queue.push(entry.oid);
+        }
       }
     }
-    if (acked.size === 0) out.push(pktLine('NAK\n'));
-    out.push(Buffer.from('0000'));
-    return Buffer.concat(out);
   }
-  // A done request is answered the way git answers it: no acknowledgments section, just the
-  // shallow bookkeeping (when the depth changed) and the packfile, delim-separated.
-  const { pack, shallow, unshallow } = selectFetchObjects(repo, request);
-  const sections: Buffer[] = [];
-  if (shallow.length > 0 || unshallow.length > 0 || deepen !== undefined) {
-    const info: Buffer[] = [pktLine('shallow-info\n')];
-    for (const oid of shallow) info.push(pktLine(`shallow ${oid}\n`));
-    for (const oid of unshallow) info.push(pktLine(`unshallow ${oid}\n`));
-    sections.push(Buffer.concat(info));
+
+  const wantReachable = collectReachable(wants, lookup, { allowMissing: true });
+  const send = new Set<string>();
+  for (const oid of wantReachable) {
+    if (!held.has(oid)) send.add(oid);
   }
-  if (pack.length > 0) {
-    sections.push(Buffer.concat([pktLine('packfile\n'), sidebandFrame(pack)]));
+
+  let ack: string | null = null;
+  for (const have of request.haves) {
+    if (wantReachable.has(have)) {
+      ack = have;
+      break;
+    }
   }
-  const out: Buffer[] = [];
-  sections.forEach((section, index) => {
-    if (index > 0) out.push(Buffer.from('0001'));
-    out.push(section);
-  });
-  out.push(Buffer.from('0000'));
-  return Buffer.concat(out);
+
+  const oldShallow = new Set(request.shallow);
+  let shallow: string[] = [];
+  let unshallow: string[] = [];
+  const includeDepth = request.depth !== null ? request.depth : null;
+  if (includeDepth !== null) {
+    const depth = includeDepth;
+    // Depth N: commits within N commits of a want; boundary = deepest included
+    // commits whose parents fall outside the included set.
+    const distance = new Map<string, number>();
+    const queue: Array<{ oid: string; dist: number }> = [];
+    for (const want of wants) {
+      const commit = peelToCommitLocal(repo, want);
+      if (commit !== null && !distance.has(commit)) {
+        distance.set(commit, 0);
+        queue.push({ oid: commit, dist: 0 });
+      }
+    }
+    const inDepth = new Set<string>();
+    while (queue.length > 0) {
+      const { oid, dist } = queue.shift()!;
+      if (dist >= depth) continue;
+      inDepth.add(oid);
+      const object = repo.objects.get(oid);
+      if (!object || object.type !== 'commit') continue;
+      for (const parent of parseCommit(object.data).parents) {
+        if (!distance.has(parent)) {
+          distance.set(parent, dist + 1);
+          queue.push({ oid: parent, dist: dist + 1 });
+        }
+      }
+    }
+    const newShallow = new Set<string>();
+    for (const oid of inDepth) {
+      const object = repo.objects.get(oid);
+      if (!object || object.type !== 'commit') continue;
+      let hasOutsideParent = false;
+      for (const parent of parseCommit(object.data).parents) {
+        if (!inDepth.has(parent)) hasOutsideParent = true;
+      }
+      if (hasOutsideParent) newShallow.add(oid);
+    }
+    // Restrict the object set to the depth-truncated graph (plus tags/blobs
+    // reachable from the included commits).
+    const restricted = new Set<string>();
+    for (const oid of inDepth) {
+      const object = repo.objects.get(oid);
+      if (!object) continue;
+      restricted.add(oid);
+      const commit = parseCommit(object.data);
+      for (const child of collectReachable([commit.tree], lookup, { allowMissing: true })) restricted.add(child);
+    }
+    for (const want of wants) {
+      const object = repo.objects.get(want);
+      if (object && object.type === 'tag') {
+        restricted.add(want);
+        const target = peelToCommitLocal(repo, want);
+        if (target !== null && inDepth.has(target)) restricted.add(target);
+      }
+    }
+    for (const oid of send) {
+      if (!restricted.has(oid)) send.delete(oid);
+    }
+    shallow = [...newShallow].filter((oid) => !oldShallow.has(oid)).sort();
+    unshallow = [...oldShallow].filter((oid) => inDepth.has(oid)).sort();
+    void ack;
+  }
+
+  // Pack order: commits, then tags, then trees, then blobs — topological enough
+  // for any client that resolves objects as it reads.
+  const ordered: GitObject[] = [];
+  const byType = (type: 'commit' | 'tag' | 'tree' | 'blob'): string[] =>
+    [...send].filter((oid) => repo.objects.get(oid)?.type === type).sort();
+  for (const type of ['commit', 'tag', 'tree', 'blob'] as const) {
+    for (const oid of byType(type)) {
+      const object = repo.objects.get(oid);
+      if (object) ordered.push(object);
+    }
+  }
+  return { objects: ordered, shallow, unshallow, ack };
 }
 
-/** Protocol v0 fetch: one request, one sideband pack, the classic shape. */
-export function handleUploadPackV0(repo: Repo, body: Buffer): { status: number; contentType: string; body: Buffer } {
-  const text = body.toString('latin1');
-  const wants: string[] = [];
-  const haves: string[] = [];
-  let done = false;
-  for (const match of text.matchAll(/want ([0-9a-f]{40})/g)) wants.push(match[1]);
-  for (const match of text.matchAll(/have ([0-9a-f]{40})/g)) haves.push(match[1]);
-  if (/(^|\n)done/.test(text) || text.includes('done\n') || body.includes(Buffer.from('done'))) done = true;
-  const request: FetchRequest = { wants, haves, shallowLines: [], deepen: undefined, done, noProgress: false };
-  const { pack } = selectFetchObjects(repo, request);
+const V2_CAPS = [
+  'version 2',
+  'agent=coreforge/1.0.0',
+  'ls-refs=unborn',
+  'fetch=shallow wait-for-done filter',
+  'server-option',
+  'object-format=sha1',
+];
+
+/** The version + capability advertisement that opens every protocol v2 response. */
+function v2Prefix(): Buffer {
+  return Buffer.concat([encodePktLines(V2_CAPS.map((line) => `${line}\n`)), pktFlush()]);
+}
+
+function handleV2Fetch(repo: Repo, request: FetchRequest, protocolVersion: 'v2'): ServiceResult {
+  const plan = planFetch(repo, request);
+  // A v2 POST response carries only the command's sections, each opened by a
+  // header line and closed by a flush packet: acknowledgments (only when the
+  // request did NOT end with `done` — a `done` fetch gets none), shallow-info,
+  // packfile. The version and capabilities were already advertised by
+  // info/refs and are not repeated here.
   const parts: Buffer[] = [];
-  if (haves.length === 0) parts.push(pktLine('NAK\n'));
-  else parts.push(pktLine(`ACK ${haves[0]}\n`));
-  if (pack.length > 0) parts.push(sidebandFrame(pack));
-  parts.push(Buffer.from('0000'));
+  if (!request.done) {
+    // The acknowledgments section ends with a DELIM when `ready` was sent
+    // (a packfile follows in this same response) and with a FLUSH when it
+    // was not (the client will send another round). A flush after `ready`
+    // makes real git die with "expected packfile to be sent after 'ready'".
+    const ackLines: string[] = ['acknowledgments\n'];
+    const hasAck = plan.ack !== null;
+    if (hasAck) ackLines.push(`ACK ${plan.ack}\n`);
+    else ackLines.push('NAK\n');
+    if (hasAck) ackLines.push('ready\n');
+    parts.push(encodePktLines(ackLines));
+    if (!hasAck) {
+      parts.push(pktFlush());
+      return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+    }
+    parts.push(pktDelim());
+  }
+  const shallowLines: string[] = ['shallow-info\n'];
+  for (const oid of plan.shallow) shallowLines.push(`shallow ${oid}\n`);
+  for (const oid of plan.unshallow) shallowLines.push(`unshallow ${oid}\n`);
+  parts.push(encodePktLines(shallowLines));
+  parts.push(pktFlush());
+  parts.push(encodePktLines(['packfile\n']));
+  const pack = writePack(plan.objects.map((object) => ({ type: object.type, data: object.data })));
+  parts.push(sidebandPackets(pack));
+  parts.push(pktFlush());
+  void protocolVersion;
   return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
 }
 
-// ------------------------------------------------------------------ receive-pack
+function handleV0Fetch(repo: Repo, request: FetchRequest): ServiceResult {
+  const plan = planFetch(repo, request);
+  const parts: Buffer[] = [];
+  const ackLines: string[] = [];
+  if (plan.ack !== null) ackLines.push(`ACK ${plan.ack}\n`);
+  else ackLines.push('NAK\n');
+  parts.push(encodePktLines(ackLines));
+  for (const oid of plan.shallow) parts.push(pktText(`shallow ${oid}\n`));
+  for (const oid of plan.unshallow) parts.push(pktText(`unshallow ${oid}\n`));
+  const pack = writePack(plan.objects.map((object) => ({ type: object.type, data: object.data })));
+  parts.push(sidebandPackets(pack));
+  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+}
 
-/** Parse the command list at the head of a receive-pack request. */
-export function parseRefCommands(body: Buffer): { commands: RefCommand[]; packStart: number } {
-  const commands: RefCommand[] = [];
+export function handleUploadPack(
+  store: Store,
+  owner: string,
+  repoName: string,
+  body: Buffer,
+  protocol: string,
+): ServiceResult {
+  const repo = store.getRepo(owner, repoName);
+  if (!repo) return notFound(`${owner}/${repoName}`);
+  let packets;
+  try {
+    packets = decodePktLines(body);
+  } catch {
+    return { status: 400, contentType: 'text/plain; charset=utf-8', body: Buffer.from('malformed pkt-line stream\n', 'utf8') };
+  }
+  const wants = new Set<string>();
+  const haves: string[] = [];
+  for (const packet of packets) {
+    if (packet.kind !== 'data') continue;
+    const text = packet.payload.toString('utf8');
+    const firstSpace = text.indexOf(' ');
+    const keyword = firstSpace < 0 ? text.trimEnd() : text.slice(0, firstSpace);
+    const rest = firstSpace < 0 ? '' : text.slice(firstSpace + 1);
+    if (keyword === 'want') wants.add(rest.trimEnd().split(' ')[0]!);
+    else if (keyword === 'have') haves.push(rest.trimEnd());
+    else if (keyword === 'done') break;
+  }
+  const request: FetchRequest = {
+    wants: [...wants],
+    haves,
+    shallow: [],
+    depth: null,
+    deepenSince: null,
+    deepenNot: [],
+    deepenRelative: false,
+    done: true,
+    filterSpec: null,
+  };
+  // The v0 request carries its own shallow/deepen lines.
+  for (const packet of packets) {
+    if (packet.kind !== 'data') continue;
+    const text = packet.payload.toString('utf8').trimEnd();
+    const firstSpace = text.indexOf(' ');
+    const keyword = firstSpace < 0 ? text : text.slice(0, firstSpace);
+    const rest = firstSpace < 0 ? '' : text.slice(firstSpace + 1);
+    if (keyword === 'shallow') request.shallow.push(rest);
+    else if (keyword === 'deepen') {
+      const depth = Number.parseInt(rest, 10);
+      if (Number.isFinite(depth)) request.depth = depth;
+    }
+  }
+  if (protocol === '2') {
+    // A v2 fetch begins with the command line, then arguments, then a flush.
+    const first = packets.find((packet) => packet.kind === 'data');
+    const firstText = first ? first.payload.toString('utf8').trimEnd() : '';
+    const v2Request = parseV2Request(body);
+    if (firstText.startsWith('command=ls-refs')) {
+      return {
+        status: 200,
+        contentType: 'application/x-git-upload-pack-result',
+        body: lsRefsResponse(repo, parseLsRefsRequest(body)),
+      };
+    }
+    if (firstText.startsWith('command=fetch')) {
+      return handleV2Fetch(repo, v2Request, 'v2');
+    }
+    // Unknown command: answer with an empty v2 fetch response rather than dying.
+    if (firstText.startsWith('command=')) {
+      return { status: 400, contentType: 'text/plain; charset=utf-8', body: Buffer.from('unknown command\n', 'utf8') };
+    }
+    return handleV2Fetch(repo, v2Request, 'v2');
+  }
+  return handleV0Fetch(repo, request);
+}
+
+// ---------------------------------------------------------------- receive-pack
+
+interface PushCommand {
+  readonly oldOid: string;
+  readonly newOid: string;
+  readonly ref: string;
+  readonly firstLine: boolean;
+}
+
+function parseReceivePackBody(body: Buffer): { commands: PushCommand[]; pack: Buffer } {
+  // Walk pkt-lines from the front until the flush packet; everything after it
+  // is the raw packfile. The pack bytes are NOT pkt-lines, so they must never
+  // be fed to the pkt-line decoder.
+  const commands: PushCommand[] = [];
   let offset = 0;
-  for (;;) {
-    if (offset + 4 > body.length) throw new Error('truncated command list');
+  while (offset + 4 <= body.length) {
     const head = body.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) throw new Error('bad pkt-line in command list');
-    const length = parseInt(head, 16);
+    if (!/^[0-9a-fA-F]{4}$/.test(head)) break;
+    const length = Number.parseInt(head, 16);
     if (length === 0) {
       offset += 4;
       break;
     }
-    if (length < 4 || offset + length > body.length) throw new Error('bad command pkt-line');
-    let payload = body.subarray(offset + 4, offset + length).toString('utf8');
-    const nul = payload.indexOf('\0');
-    if (nul >= 0) payload = payload.slice(0, nul);
-    const line = payload.replace(/\n$/, '');
-    const parts = line.split(' ');
-    if (parts.length >= 3) {
-      commands.push({ oldOid: parts[0], newOid: parts[1], ref: parts.slice(2).join(' ') });
+    if (length === 1 || length === 2) {
+      offset += 4;
+      continue;
+    }
+    if (offset + length > body.length) break;
+    const text = body.subarray(offset + 4, offset + length).toString('utf8');
+    const nul = text.indexOf('\0');
+    const clean = nul < 0 ? text : text.slice(0, nul);
+    const fields = clean.trimEnd().split(' ');
+    if (fields.length >= 3) {
+      commands.push({ oldOid: fields[0]!, newOid: fields[1]!, ref: fields[2]!, firstLine: commands.length === 0 });
     }
     offset += length;
   }
-  return { commands, packStart: offset };
+  const pack = offset < body.length ? Buffer.from(body.subarray(offset)) : Buffer.alloc(0);
+  return { commands, pack };
 }
 
-function isFastForward(repo: Repo, oldOid: string, newOid: string): boolean {
-  const oldCommit = repo.peelToCommit(oldOid);
-  const newCommit = repo.peelToCommit(newOid);
-  if (!oldCommit || !newCommit) return false;
-  return repo.isAncestor(oldCommit, newCommit);
-}
-
-export function handleReceivePack(repo: Repo, body: Buffer): { status: number; contentType: string; body: Buffer } {
-  const { commands, packStart } = parseRefCommands(body);
-  const packBytes = body.subarray(packStart);
-  let unpackLine = 'unpack ok\n';
-  if (packBytes.length > 0) {
+export function handleReceivePack(
+  store: Store,
+  owner: string,
+  repoName: string,
+  body: Buffer,
+): ServiceResult {
+  const repo = store.getRepo(owner, repoName);
+  if (!repo) return notFound(`${owner}/${repoName}`);
+  const { commands, pack } = parseReceivePackBody(body);
+  const report: string[] = [];
+  let unpackError: string | null = null;
+  const incoming = new Map<string, GitObject>();
+  if (pack.length > 0) {
     try {
-      const { objects } = readPack(Buffer.from(packBytes), (oid) => repo.getObject(oid));
-      for (const [oid, object] of objects) {
-        if (!repo.objects.has(oid)) repo.objects.set(oid, object);
-      }
-    } catch (error) {
-      unpackLine = `unpack ${(error as Error).message}\n`;
+      const read = readPack(pack, { resolveBase: (oid) => repo.objects.get(oid) });
+      for (const [oid, object] of read.objects) incoming.set(oid, object);
+    } catch (err) {
+      unpackError = (err as Error).message;
     }
   }
-  const results: string[] = [];
-  if (unpackLine === 'unpack ok\n') {
-    for (const command of commands) {
-      results.push(applyRefCommand(repo, command));
+  const sidebandRequested = body.toString('utf8').includes('side-band-64k') || body.toString('utf8').includes('side-band');
+  if (unpackError === null) {
+    for (const [oid, object] of incoming) {
+      if (!repo.objects.has(oid)) repo.objects.set(oid, object);
     }
+  }
+  const lines: string[] = [];
+  if (unpackError !== null) {
+    lines.push(`unpack ${unpackError}\n`);
   } else {
-    for (const command of commands) results.push(`ng ${command.ref} unpack failed\n`);
+    lines.push('unpack ok\n');
   }
-  const report = Buffer.concat([pktLine(unpackLine), ...results.map((line) => pktLine(line)), Buffer.from('0000')]);
-  const framed = Buffer.concat([
-    pktLine(Buffer.concat([Buffer.from([1]), report])),
-    Buffer.from('0000'),
-  ]);
-  return { status: 200, contentType: 'application/x-git-receive-pack-result', body: framed };
+  for (const command of commands) {
+    if (unpackError !== null) {
+      report.push(`ng ${command.ref} unpack failed\n`);
+      lines.push(`ng ${command.ref} unpack failed\n`);
+      continue;
+    }
+    const oldOid = command.oldOid;
+    const newOid = command.newOid;
+    const ref = command.ref;
+    const current = repo.refs.get(ref);
+    if (newOid === ZERO_OID) {
+      if (oldOid === ZERO_OID || current === oldOid || current === undefined) {
+        if (current !== undefined) repo.refs.delete(ref);
+        report.push(`ok ${ref}\n`);
+        lines.push(`ok ${ref}\n`);
+      } else {
+        report.push(`ng ${ref} reference does not match\n`);
+        lines.push(`ng ${ref} reference does not match\n`);
+      }
+      continue;
+    }
+    const target = repo.objects.get(newOid) ?? incoming.get(newOid);
+    if (!target) {
+      report.push(`ng ${ref} object ${newOid} is missing\n`);
+      lines.push(`ng ${ref} object ${newOid} is missing\n`);
+      continue;
+    }
+    if (oldOid === ZERO_OID) {
+      if (current !== undefined) {
+        report.push(`ng ${ref} already exists\n`);
+        lines.push(`ng ${ref} already exists\n`);
+        continue;
+      }
+      repo.refs.set(ref, newOid);
+      report.push(`ok ${ref}\n`);
+      lines.push(`ok ${ref}\n`);
+      continue;
+    }
+    if (current === undefined) {
+      report.push(`ng ${ref} reference does not exist\n`);
+      lines.push(`ng ${ref} reference does not exist\n`);
+      continue;
+    }
+    if (current !== oldOid) {
+      report.push(`ng ${ref} reference does not match\n`);
+      lines.push(`ng ${ref} reference does not match\n`);
+      continue;
+    }
+    const newCommit = peelToCommitLocal(repo, newOid);
+    if (newCommit === null || !isAncestor(oldOid, newCommit, (oid) => repo.objects.get(oid))) {
+      report.push(`ng ${ref} non-fast-forward\n`);
+      lines.push(`ng ${ref} non-fast-forward\n`);
+      continue;
+    }
+    repo.refs.set(ref, newOid);
+    report.push(`ok ${ref}\n`);
+    lines.push(`ok ${ref}\n`);
+  }
+  void report;
+  // The report-status stream is itself pkt-lined; when the client asked for
+  // side-band-64k those pkt-lines travel inside band-1 sideband packets
+  // (real git's demuxer strips the sideband and hands plain pkt-lines to its
+  // packet reader — raw text inside band 1 makes it read "unpack" as a length
+  // and die). Without side-band-64k the pkt-line stream goes out directly.
+  const reportStream = Buffer.concat([encodePktLines(lines), pktFlush()]);
+  const bodyOut = sidebandRequested
+    ? Buffer.concat([sidebandPackets(reportStream), pktFlush()])
+    : reportStream;
+  return { status: 200, contentType: 'application/x-git-receive-pack-result', body: bodyOut };
 }
 
-function applyRefCommand(repo: Repo, command: RefCommand): string {
-  const current = repo.refs.get(command.ref) ?? ZERO_OID;
-  if (command.newOid === ZERO_OID) {
-    // Delete: the client's old value must match what we hold.
-    if (current === ZERO_OID) return `ng ${command.ref} reference not found\n`;
-    if (command.oldOid !== ZERO_OID && command.oldOid !== current) {
-      return `ng ${command.ref} expected ${command.oldOid} but is ${current}\n`;
-    }
-    repo.refs.delete(command.ref);
-    return `ok ${command.ref}\n`;
-  }
-  if (!repo.getObject(command.newOid)) return `ng ${command.ref} missing object ${command.newOid}\n`;
-  if (current === ZERO_OID) {
-    if (command.oldOid !== ZERO_OID) return `ng ${command.ref} reference already exists\n`;
-    repo.refs.set(command.ref, command.newOid);
-    return `ok ${command.ref}\n`;
-  }
-  if (command.oldOid !== current) {
-    return `ng ${command.ref} expected ${command.oldOid} but is ${current}\n`;
-  }
-  const isTagRef = command.ref.startsWith('refs/tags/');
-  if (!isTagRef && !isFastForward(repo, current, command.newOid)) {
-    return `ng ${command.ref} non-fast-forward\n`;
-  }
-  repo.refs.set(command.ref, command.newOid);
-  return `ok ${command.ref}\n`;
+// ---------------------------------------------------------------- helpers
+
+export function emptyTreeOid(repo: Repo): string {
+  return hashObject('tree', buildTree([]));
 }

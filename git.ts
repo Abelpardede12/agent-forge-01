@@ -1,10 +1,11 @@
-// git.ts — the git object model in pure Node: hashing, tree/commit/tag parsing and building,
-// packfile reading (with ofs/ref delta resolution) and packfile writing (full objects only),
-// plus the pkt-line codec the smart-HTTP protocol speaks. Nothing here shells out: the trial
-// sandbox has no git binary, so the forge is its own git.
+// Pure git object model, packfile codec and pkt-line framing. No store, no I/O:
+// every function here is deterministic over its inputs. Node built-ins only.
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
+
+export const ZERO_OID = '0'.repeat(40);
+const HEX40 = /^[0-9a-f]{40}$/;
 
 export type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
 
@@ -13,24 +14,21 @@ export interface GitObject {
   readonly data: Buffer;
 }
 
-export const ZERO_OID = '0'.repeat(40);
+export function isOid(value: string): boolean {
+  return HEX40.test(value);
+}
 
-const TYPE_IDS: Readonly<Record<GitObjectType, number>> = { commit: 1, tree: 2, blob: 3, tag: 4 };
-const ID_TYPES: readonly (GitObjectType | '')[] = ['', 'commit', 'tree', 'blob', 'tag'];
-
-/** SHA-1 of a git object: sha1("<type> <size>\0" + data), as lowercase hex. */
 export function hashObject(type: GitObjectType, data: Uint8Array): string {
+  const body = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const hash = createHash('sha1');
-  hash.update(`${type} ${data.length}\0`, 'utf8');
-  hash.update(data);
+  hash.update(Buffer.from(`${type} ${body.length}\0`, 'utf8'));
+  hash.update(body);
   return hash.digest('hex');
 }
 
-export function isObjectId(value: string): boolean {
-  return /^[0-9a-f]{40}$/.test(value);
-}
+export type ObjectLookup = (oid: string) => GitObject | undefined;
 
-// ------------------------------------------------------------------ trees
+// ---------------------------------------------------------------- trees
 
 export interface TreeEntry {
   readonly mode: string;
@@ -38,34 +36,34 @@ export interface TreeEntry {
   readonly oid: string;
 }
 
-/** Parse a tree object's bytes into its entries, in stored order. */
 export function parseTree(data: Uint8Array): TreeEntry[] {
+  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const entries: TreeEntry[] = [];
   let offset = 0;
-  while (offset < data.length) {
-    const space = data.indexOf(0x20, offset);
-    const nul = data.indexOf(0x00, space);
-    const mode = Buffer.from(data.subarray(offset, space)).toString('utf8');
-    const name = Buffer.from(data.subarray(space + 1, nul)).toString('utf8');
-    const oid = Buffer.from(data.subarray(nul + 1, nul + 21)).toString('hex');
-    entries.push({ mode, name, oid });
+  while (offset < buffer.length) {
+    const space = buffer.indexOf(0x20, offset);
+    if (space < 0) throw new Error('tree entry has no mode separator');
+    const nul = buffer.indexOf(0x00, space + 1);
+    if (nul < 0) throw new Error('tree entry has no name terminator');
+    if (nul + 21 > buffer.length) throw new Error('tree entry has a truncated object id');
+    entries.push({
+      mode: buffer.subarray(offset, space).toString('ascii'),
+      name: buffer.subarray(space + 1, nul).toString('utf8'),
+      oid: buffer.subarray(nul + 1, nul + 21).toString('hex'),
+    });
     offset = nul + 21;
   }
   return entries;
 }
 
-/** Git's tree ordering: names compare bytewise, directories as if they ended in '/'. */
-function treeSortKey(entry: TreeEntry): string {
-  return isTreeMode(entry.mode) ? `${entry.name}/` : entry.name;
+function compareTreeNames(a: TreeEntry, b: TreeEntry): number {
+  const left = Buffer.from(a.mode === '40000' ? `${a.name}/` : a.name, 'utf8');
+  const right = Buffer.from(b.mode === '40000' ? `${b.name}/` : b.name, 'utf8');
+  return Buffer.compare(left, right);
 }
 
-/** Serialize entries into a tree object, sorted the way git sorts them. */
 export function buildTree(entries: readonly TreeEntry[]): Buffer {
-  const sorted = [...entries].sort((a, b) => {
-    const ka = treeSortKey(a);
-    const kb = treeSortKey(b);
-    return ka < kb ? -1 : ka > kb ? 1 : 0;
-  });
+  const sorted = [...entries].sort(compareTreeNames);
   const parts: Buffer[] = [];
   for (const entry of sorted) {
     parts.push(Buffer.from(`${entry.mode} ${entry.name}\0`, 'utf8'));
@@ -74,402 +72,566 @@ export function buildTree(entries: readonly TreeEntry[]): Buffer {
   return Buffer.concat(parts);
 }
 
-export function isTreeMode(mode: string): boolean {
-  return mode === '40000' || mode === '040000';
-}
-
-// ------------------------------------------------------------------ commits and tags
+// ---------------------------------------------------------------- commits and tags
 
 export interface CommitView {
   readonly tree: string;
-  readonly parents: readonly string[];
+  readonly parents: string[];
   readonly author: string;
   readonly committer: string;
   readonly message: string;
 }
 
 export function parseCommit(data: Uint8Array): CommitView {
-  const text = Buffer.from(data).toString('utf8');
-  const split = text.indexOf('\n\n');
-  const head = split >= 0 ? text.slice(0, split) : text;
-  const message = split >= 0 ? text.slice(split + 2) : '';
+  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const blank = buffer.indexOf('\n\n');
+  const headerEnd = blank < 0 ? buffer.length : blank;
+  const message = blank < 0 ? '' : buffer.subarray(blank + 2).toString('utf8');
   let tree = '';
+  const parents: string[] = [];
   let author = '';
   let committer = '';
-  const parents: string[] = [];
-  for (const line of head.split('\n')) {
-    if (line.startsWith('tree ')) tree = line.slice(5).trim();
-    else if (line.startsWith('parent ')) parents.push(line.slice(7).trim());
-    else if (line.startsWith('author ')) author = line.slice(7);
-    else if (line.startsWith('committer ')) committer = line.slice(10);
+  for (const line of buffer.subarray(0, headerEnd).toString('utf8').split('\n')) {
+    if (!line) continue;
+    const space = line.indexOf(' ');
+    const key = space < 0 ? line : line.slice(0, space);
+    const value = space < 0 ? '' : line.slice(space + 1);
+    if (key === 'tree') tree = value;
+    else if (key === 'parent') parents.push(value);
+    else if (key === 'author') author = value;
+    else if (key === 'committer') committer = value;
   }
+  if (!isOid(tree)) throw new Error('commit has no valid tree header');
   return { tree, parents, author, committer, message };
-}
-
-/** The unix timestamp inside an author/committer line ("Name <mail> 1735689600 +0000"), or 0. */
-export function identityTimestamp(identity: string): number {
-  const match = / (\d+) [+-]\d{4}$/.exec(identity.trim());
-  return match ? Number(match[1]) : 0;
 }
 
 export function buildCommit(fields: {
   tree: string;
-  parents: readonly string[];
+  parents?: readonly string[];
+  message: string;
   author: string;
   committer: string;
-  message: string;
+  timestamp: number;
+  timezone?: string;
 }): Buffer {
+  const tz = fields.timezone ?? '+0000';
   const lines = [`tree ${fields.tree}`];
-  for (const parent of fields.parents) lines.push(`parent ${parent}`);
-  lines.push(`author ${fields.author}`);
-  lines.push(`committer ${fields.committer}`);
-  const message = fields.message.endsWith('\n') ? fields.message : `${fields.message}\n`;
-  return Buffer.from(`${lines.join('\n')}\n\n${message}`, 'utf8');
+  for (const parent of fields.parents ?? []) lines.push(`parent ${parent}`);
+  lines.push(`author ${fields.author} ${fields.timestamp} ${tz}`);
+  lines.push(`committer ${fields.committer} ${fields.timestamp} ${tz}`);
+  lines.push('');
+  return Buffer.from(`${lines.join('\n')}\n${fields.message}`, 'utf8');
 }
 
 export interface TagView {
   readonly object: string;
-  readonly type: string;
+  readonly type: GitObjectType;
   readonly tag: string;
   readonly tagger: string;
   readonly message: string;
 }
 
 export function parseTag(data: Uint8Array): TagView {
-  const text = Buffer.from(data).toString('utf8');
-  const split = text.indexOf('\n\n');
-  const head = split >= 0 ? text.slice(0, split) : text;
-  const view: TagView = {
-    object: '',
-    type: '',
-    tag: '',
-    tagger: '',
-    message: split >= 0 ? text.slice(split + 2) : '',
-  };
-  for (const line of head.split('\n')) {
-    if (line.startsWith('object ')) view.object = line.slice(7).trim();
-    else if (line.startsWith('type ')) view.type = line.slice(5).trim();
-    else if (line.startsWith('tag ')) view.tag = line.slice(4).trim();
-    else if (line.startsWith('tagger ')) view.tagger = line.slice(7);
+  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const blank = buffer.indexOf('\n\n');
+  const headerEnd = blank < 0 ? buffer.length : blank;
+  const headers = new Map<string, string>();
+  for (const line of buffer.subarray(0, headerEnd).toString('utf8').split('\n')) {
+    if (!line) continue;
+    const space = line.indexOf(' ');
+    if (space < 0) continue;
+    headers.set(line.slice(0, space), line.slice(space + 1));
   }
-  return view;
+  const object = headers.get('object') ?? '';
+  const type = headers.get('type') ?? '';
+  if (!isOid(object)) throw new Error('tag has no valid object header');
+  if (type !== 'commit' && type !== 'tree' && type !== 'blob' && type !== 'tag') {
+    throw new Error(`tag has bad type ${JSON.stringify(type)}`);
+  }
+  return {
+    object,
+    type: type as GitObjectType,
+    tag: headers.get('tag') ?? '',
+    tagger: headers.get('tagger') ?? '',
+    message: blank < 0 ? '' : buffer.subarray(blank + 2).toString('utf8'),
+  };
 }
 
-// ------------------------------------------------------------------ pack writing
+// ---------------------------------------------------------------- reachability
 
-/** One object header inside a pack: the variable-length type+size encoding. */
+/** Every object reachable from `roots`. Throws on a missing object unless allowMissing. */
+export function collectReachable(
+  roots: Iterable<string>,
+  lookup: ObjectLookup,
+  options: { allowMissing?: boolean } = {},
+): Set<string> {
+  const seen = new Set<string>();
+  const queue: string[] = [];
+  for (const root of roots) if (isOid(root)) queue.push(root);
+  while (queue.length > 0) {
+    const oid = queue.pop()!;
+    if (seen.has(oid)) continue;
+    const object = lookup(oid);
+    if (!object) {
+      if (options.allowMissing) continue;
+      throw new Error(`object ${oid} is missing from the store`);
+    }
+    seen.add(oid);
+    if (object.type === 'commit') {
+      const commit = parseCommit(object.data);
+      queue.push(commit.tree);
+      for (const parent of commit.parents) queue.push(parent);
+    } else if (object.type === 'tag') {
+      queue.push(parseTag(object.data).object);
+    } else if (object.type === 'tree') {
+      for (const entry of parseTree(object.data)) {
+        if (entry.mode === '160000') continue;
+        queue.push(entry.oid);
+      }
+    }
+  }
+  return seen;
+}
+
+/** Peel a tag (possibly nested) to the commit it names, or the oid itself when it is one. */
+export function peelToCommit(oid: string, lookup: ObjectLookup): string | null {
+  let current = oid;
+  const seen = new Set<string>();
+  for (;;) {
+    if (seen.has(current)) return null;
+    seen.add(current);
+    const object = lookup(current);
+    if (!object) return null;
+    if (object.type === 'commit') return current;
+    if (object.type === 'tag') {
+      current = parseTag(object.data).object;
+      continue;
+    }
+    return null;
+  }
+}
+
+/** True when `ancestor` is reachable from `tip` following parent links (or equal). */
+export function isAncestor(ancestor: string, tip: string, lookup: ObjectLookup): boolean {
+  if (ancestor === tip) return true;
+  const seen = new Set<string>();
+  const queue = [tip];
+  while (queue.length > 0) {
+    const oid = queue.pop()!;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const object = lookup(oid);
+    if (!object || object.type !== 'commit') continue;
+    for (const parent of parseCommit(object.data).parents) {
+      if (parent === ancestor) return true;
+      queue.push(parent);
+    }
+  }
+  return false;
+}
+
+/** The nearest common ancestor of two commits (best-effort BFS from both sides). */
+export function mergeBase(a: string, b: string, lookup: ObjectLookup): string | null {
+  if (a === b) return a;
+  const ancestorsA = new Set<string>();
+  const queueA = [a];
+  while (queueA.length > 0) {
+    const oid = queueA.pop()!;
+    if (ancestorsA.has(oid)) continue;
+    ancestorsA.add(oid);
+    const object = lookup(oid);
+    if (!object || object.type !== 'commit') continue;
+    for (const parent of parseCommit(object.data).parents) queueA.push(parent);
+  }
+  const queueB = [b];
+  const seenB = new Set<string>();
+  while (queueB.length > 0) {
+    const oid = queueB.pop()!;
+    if (seenB.has(oid)) continue;
+    seenB.add(oid);
+    if (ancestorsA.has(oid)) return oid;
+    const object = lookup(oid);
+    if (!object || object.type !== 'commit') continue;
+    for (const parent of parseCommit(object.data).parents) queueB.push(parent);
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------- deltas
+
+function readVarint(buffer: Buffer, offset: number): { value: number; next: number } {
+  let value = 0;
+  let shift = 0;
+  let at = offset;
+  for (;;) {
+    if (at >= buffer.length) throw new Error('delta size varint is truncated');
+    const byte = buffer[at++];
+    value += (byte & 0x7f) * 2 ** shift;
+    shift += 7;
+    if (!(byte & 0x80)) break;
+    if (shift > 63) throw new Error('delta size varint is too long');
+  }
+  return { value, next: at };
+}
+
+export function applyDelta(base: Uint8Array, delta: Uint8Array): Buffer {
+  const baseBuffer = Buffer.isBuffer(base) ? base : Buffer.from(base);
+  const deltaBuffer = Buffer.isBuffer(delta) ? delta : Buffer.from(delta);
+  let offset = 0;
+  const sourceSize = readVarint(deltaBuffer, offset);
+  offset = sourceSize.next;
+  const targetSize = readVarint(deltaBuffer, offset);
+  offset = targetSize.next;
+  if (sourceSize.value !== baseBuffer.length) {
+    throw new Error(`delta expects a ${sourceSize.value}-byte base, got ${baseBuffer.length}`);
+  }
+  const out = Buffer.allocUnsafe(targetSize.value);
+  let written = 0;
+  while (offset < deltaBuffer.length) {
+    const op = deltaBuffer[offset++];
+    if (op & 0x80) {
+      let copyOffset = 0;
+      let copySize = 0;
+      let shift = 0;
+      for (let bit = 0; bit < 4; bit += 1) {
+        if (op & (1 << bit)) {
+          if (offset >= deltaBuffer.length) throw new Error('delta copy offset is truncated');
+          copyOffset += deltaBuffer[offset++] * 2 ** shift;
+        }
+        shift += 8;
+      }
+      shift = 0;
+      for (let bit = 4; bit < 7; bit += 1) {
+        if (op & (1 << bit)) {
+          if (offset >= deltaBuffer.length) throw new Error('delta copy size is truncated');
+          copySize += deltaBuffer[offset++] * 2 ** shift;
+        }
+        shift += 8;
+      }
+      if (copySize === 0) copySize = 0x10000;
+      if (copyOffset + copySize > baseBuffer.length) throw new Error('delta copy is out of the base');
+      if (written + copySize > targetSize.value) throw new Error('delta writes past its target size');
+      baseBuffer.copy(out, written, copyOffset, copyOffset + copySize);
+      written += copySize;
+    } else if (op !== 0) {
+      const literal = op & 0x7f;
+      if (offset + literal > deltaBuffer.length) throw new Error('delta insert is truncated');
+      if (written + literal > targetSize.value) throw new Error('delta writes past its target size');
+      deltaBuffer.copy(out, written, offset, offset + literal);
+      offset += literal;
+      written += literal;
+    } else {
+      throw new Error('delta opcode 0 is invalid');
+    }
+  }
+  if (written !== targetSize.value) throw new Error(`delta produced ${written} of ${targetSize.value} bytes`);
+  return out;
+}
+
+// ---------------------------------------------------------------- packfiles
+
+const TYPE_CODE: Readonly<Record<GitObjectType, number>> = { commit: 1, tree: 2, blob: 3, tag: 4 };
+const CODE_TYPE: Readonly<Record<number, GitObjectType>> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
+
+export interface PackReadResult {
+  readonly version: number;
+  readonly objects: Map<string, GitObject>;
+  readonly deltaCount: number;
+}
+
+function readPackSize(buffer: Buffer, start: number): { size: number; next: number; first: number } {
+  if (start >= buffer.length) throw new Error('pack entry has no size header');
+  let byte = buffer[start];
+  const first = byte;
+  let size = byte & 0x0f;
+  let shift = 4;
+  let offset = start + 1;
+  while (byte & 0x80) {
+    if (offset >= buffer.length) throw new Error('pack entry size varint is truncated');
+    byte = buffer[offset++];
+    size += (byte & 0x7f) * 2 ** shift;
+    shift += 7;
+    if (shift > 63) throw new Error('pack entry size varint is too long');
+  }
+  return { size, next: offset, first };
+}
+
+function readOfsBase(buffer: Buffer, start: number): { baseOffset: number; next: number } {
+  if (start >= buffer.length) throw new Error('ofs-delta has no base offset');
+  let byte = buffer[start];
+  let offset = start + 1;
+  let value = byte & 0x7f;
+  while (byte & 0x80) {
+    if (offset >= buffer.length) throw new Error('ofs-delta base offset is truncated');
+    byte = buffer[offset++];
+    value = ((value + 1) * 128) + (byte & 0x7f);
+  }
+  return { baseOffset: value, next: offset };
+}
+
+function inflateAt(buffer: Buffer, offset: number): { data: Buffer; next: number } {
+  let result: { buffer: Buffer; engine: { bytesWritten: number } };
+  try {
+    result = inflateSync(buffer.subarray(offset), { info: true }) as unknown as {
+      buffer: Buffer;
+      engine: { bytesWritten: number };
+    };
+  } catch (err) {
+    throw new Error(`zlib stream at offset ${offset} did not inflate: ${(err as Error).message}`);
+  }
+  const written = result.engine.bytesWritten;
+  if (!written || written <= 0) throw new Error(`zlib stream at offset ${offset} consumed no bytes`);
+  return { data: result.buffer, next: offset + written };
+}
+
+/** Read a packfile (v2/v3), resolving OFS_DELTA and REF_DELTA entries. */
+export function readPack(pack: Uint8Array, options: { resolveBase?: ObjectLookup } = {}): PackReadResult {
+  const buffer = Buffer.isBuffer(pack) ? pack : Buffer.from(pack);
+  if (buffer.length < 32) throw new Error(`pack is ${buffer.length} bytes, too short`);
+  if (buffer.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('pack does not start with PACK');
+  const version = buffer.readUInt32BE(4);
+  if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
+  const declaredCount = buffer.readUInt32BE(8);
+  const trailerStart = buffer.length - 20;
+  const trailer = buffer.subarray(trailerStart).toString('hex');
+  const computed = createHash('sha1').update(buffer.subarray(0, trailerStart)).digest('hex');
+  if (trailer !== computed) throw new Error('pack trailer checksum mismatch');
+
+  interface RawEntry {
+    offset: number;
+    typeCode: number;
+    size: number;
+    data: Buffer;
+    baseOffset?: number;
+    baseOid?: string;
+    resolvedType?: GitObjectType;
+    resolved?: Buffer;
+    oid?: string;
+  }
+  const raw: RawEntry[] = [];
+  const byOffset = new Map<number, RawEntry>();
+  let offset = 12;
+  for (let index = 0; index < declaredCount; index += 1) {
+    const entryOffset = offset;
+    const header = readPackSize(buffer, offset);
+    offset = header.next;
+    const typeCode = (header.first >> 4) & 0x07;
+    const entry: RawEntry = { offset: entryOffset, typeCode, size: header.size, data: Buffer.alloc(0) };
+    if (typeCode === 6) {
+      const base = readOfsBase(buffer, offset);
+      offset = base.next;
+      if (base.baseOffset <= 0 || base.baseOffset > entryOffset) {
+        throw new Error(`ofs-delta at ${entryOffset} names an invalid base offset ${base.baseOffset}`);
+      }
+      entry.baseOffset = entryOffset - base.baseOffset;
+    } else if (typeCode === 7) {
+      if (offset + 20 > trailerStart) throw new Error('ref-delta base id is truncated');
+      entry.baseOid = buffer.subarray(offset, offset + 20).toString('hex');
+      offset += 20;
+    } else if (!CODE_TYPE[typeCode]) {
+      throw new Error(`pack entry ${index} has unknown type code ${typeCode}`);
+    }
+    const inflated = inflateAt(buffer.subarray(0, trailerStart), offset);
+    if (inflated.data.length !== header.size) {
+      throw new Error(`pack entry at ${entryOffset} declares ${header.size} bytes but inflated to ${inflated.data.length}`);
+    }
+    entry.data = inflated.data;
+    offset = inflated.next;
+    raw.push(entry);
+    byOffset.set(entryOffset, entry);
+  }
+  if (offset !== trailerStart) throw new Error(`pack has ${trailerStart - offset} stray bytes before its trailer`);
+
+  const objects = new Map<string, GitObject>();
+  const resolvedByOid = new Map<string, RawEntry>();
+  const resolving = new Set<number>();
+  const resolve = (entry: RawEntry): { type: GitObjectType; data: Buffer; oid: string } => {
+    if (entry.resolved && entry.resolvedType && entry.oid) {
+      return { type: entry.resolvedType, data: entry.resolved, oid: entry.oid };
+    }
+    if (resolving.has(entry.offset)) throw new Error(`delta cycle at pack offset ${entry.offset}`);
+    resolving.add(entry.offset);
+    let type: GitObjectType;
+    let data: Buffer;
+    if (entry.typeCode === 6) {
+      const baseEntry = byOffset.get(entry.baseOffset!);
+      if (!baseEntry) throw new Error(`ofs-delta base at offset ${entry.baseOffset} is not in the pack`);
+      const base = resolve(baseEntry);
+      type = base.type;
+      data = applyDelta(base.data, entry.data);
+    } else if (entry.typeCode === 7) {
+      const wanted = entry.baseOid!;
+      const baseEntry = resolvedByOid.get(wanted);
+      if (baseEntry) {
+        const base = resolve(baseEntry);
+        type = base.type;
+        data = applyDelta(base.data, entry.data);
+      } else {
+        const external = options.resolveBase?.(wanted);
+        if (!external) throw new Error(`ref-delta base ${wanted} is neither in the pack nor supplied`);
+        type = external.type;
+        data = applyDelta(external.data, entry.data);
+      }
+    } else {
+      type = CODE_TYPE[entry.typeCode];
+      data = entry.data;
+    }
+    const oid = hashObject(type, data);
+    entry.resolved = data;
+    entry.resolvedType = type;
+    entry.oid = oid;
+    resolvedByOid.set(oid, entry);
+    resolving.delete(entry.offset);
+    return { type, data, oid };
+  };
+
+  let deltaCount = 0;
+  for (const entry of raw) {
+    const resolved = resolve(entry);
+    if (entry.typeCode === 6 || entry.typeCode === 7) deltaCount += 1;
+    if (!objects.has(resolved.oid)) objects.set(resolved.oid, { type: resolved.type, data: resolved.data });
+  }
+  return { version, objects, deltaCount };
+}
+
 function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
+  const code = TYPE_CODE[type];
   const bytes: number[] = [];
-  let first = (TYPE_IDS[type] << 4) | (size & 0x0f);
-  size = Math.floor(size / 16);
-  while (size > 0) {
+  let remaining = size;
+  let first = (code << 4) | (remaining & 0x0f);
+  remaining = Math.floor(remaining / 16);
+  while (remaining > 0) {
     bytes.push(first | 0x80);
-    first = size & 0x7f;
-    size = Math.floor(size / 128);
+    first = remaining & 0x7f;
+    remaining = Math.floor(remaining / 128);
   }
   bytes.push(first);
   return Buffer.from(bytes);
 }
 
-/**
- * Build a packfile holding the given objects whole (never delta-compressed: a reader that
- * resolves no deltas still reads every object, and correctness beats bytes here).
- */
-export function writePack(objects: Iterable<GitObject>): Buffer {
+/** Build a packfile from plain objects (no deltas). Order is the caller's. */
+export function writePack(objects: Iterable<{ type: GitObjectType; data: Uint8Array }>): Buffer {
   const list = [...objects];
   const parts: Buffer[] = [];
-  const header = Buffer.alloc(12);
-  header.write('PACK', 0, 'ascii');
+  const header = Buffer.allocUnsafe(12);
+  header.write('PACK', 0, 4, 'ascii');
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(list.length, 8);
   parts.push(header);
   for (const object of list) {
-    parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    const data = Buffer.isBuffer(object.data) ? object.data : Buffer.from(object.data);
+    parts.push(writePackObjectHeader(object.type, data.length));
+    parts.push(deflateSync(data));
   }
   const body = Buffer.concat(parts);
-  const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
 }
 
-/** Apply a git delta (copy/insert instructions) to a base object, per the pack format. */
-export function applyDelta(base: Uint8Array, delta: Uint8Array): Buffer {
-  let offset = 0;
-  const readVarint = (): number => {
-    let value = 0;
-    let shift = 0;
-    for (;;) {
-      const byte = delta[offset];
-      offset += 1;
-      value |= (byte & 0x7f) << shift;
-      shift += 7;
-      if ((byte & 0x80) === 0) break;
-    }
-    return value;
-  };
-  const sourceSize = readVarint();
-  if (sourceSize !== base.length) throw new Error(`delta base size ${sourceSize} does not match ${base.length}`);
-  const targetSize = readVarint();
-  const out: Buffer[] = [];
-  let produced = 0;
-  while (offset < delta.length) {
-    const opcode = delta[offset];
-    offset += 1;
-    if (opcode & 0x80) {
-      let copyOffset = 0;
-      let copySize = 0;
-      for (let bit = 0; bit < 4; bit += 1) {
-        if (opcode & (1 << bit)) {
-          copyOffset |= delta[offset] << (8 * bit);
-          offset += 1;
-        }
-      }
-      for (let bit = 0; bit < 3; bit += 1) {
-        if (opcode & (0x10 << bit)) {
-          copySize |= delta[offset] << (8 * bit);
-          offset += 1;
-        }
-      }
-      if (copySize === 0) copySize = 0x10000;
-      out.push(Buffer.from(base.subarray(copyOffset, copyOffset + copySize)));
-      produced += copySize;
-    } else if (opcode > 0) {
-      out.push(Buffer.from(delta.subarray(offset, offset + opcode)));
-      produced += opcode;
-      offset += opcode;
-    } else {
-      throw new Error('delta opcode 0 is reserved');
-    }
-  }
-  const result = Buffer.concat(out);
-  if (produced !== targetSize || result.length !== targetSize) {
-    throw new Error(`delta produced ${result.length} bytes, expected ${targetSize}`);
-  }
-  return result;
+/** SHA-1 of every pack byte before the 20-byte trailer. */
+export function packChecksum(pack: Uint8Array): string {
+  const buffer = Buffer.isBuffer(pack) ? pack : Buffer.from(pack);
+  if (buffer.length < 20) throw new Error('pack is shorter than its trailer');
+  return createHash('sha1').update(buffer.subarray(0, buffer.length - 20)).digest('hex');
 }
 
-// ------------------------------------------------------------------ pack reading
-
-/**
- * How many compressed bytes the zlib stream starting at `offset` occupies. inflateSync tolerates
- * trailing bytes, so success is monotone in slice length and the exact length is the smallest
- * slice that inflates: bracket it exponentially, then binary-search the boundary.
- */
-function inflatedLength(pack: Buffer, offset: number, end: number): number {
-  const succeeds = (length: number): boolean => {
-    try {
-      inflateSync(pack.subarray(offset, offset + length));
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  const limit = end - offset;
-  if (!succeeds(limit)) throw new Error('pack object does not inflate');
-  let failing = 0;
-  let passing = limit;
-  let probe = 32;
-  while (probe < limit && !succeeds(probe)) {
-    failing = probe;
-    probe *= 2;
-  }
-  if (probe < limit) passing = probe;
-  while (passing - failing > 1) {
-    const mid = Math.floor((failing + passing) / 2);
-    if (succeeds(mid)) passing = mid;
-    else failing = mid;
-  }
-  return passing;
+export function verifyPackChecksum(pack: Uint8Array): { ok: boolean; expected: string; actual: string } {
+  const buffer = Buffer.isBuffer(pack) ? pack : Buffer.from(pack);
+  const actual = buffer.subarray(buffer.length - 20).toString('hex');
+  const expected = packChecksum(buffer);
+  return { ok: actual === expected, expected, actual };
 }
 
-/**
- * Inflate the stream starting at `offset`, returning its data and its exact compressed length.
- * The zlib engine reports how many input bytes it consumed, which makes finding the next
- * object a single call; the binary search below stays as a fallback for engines that do not.
- */
-function inflateExact(pack: Buffer, offset: number, end: number): { data: Buffer; length: number } {
-  const slice = pack.subarray(offset, end);
-  try {
-    const result = inflateSync(slice, { info: true }) as unknown as {
-      buffer: Buffer;
-      engine?: { bytesWritten?: number };
-    };
-    const consumed = result.engine?.bytesWritten;
-    if (typeof consumed === 'number' && consumed > 0 && consumed <= slice.length) {
-      return { data: result.buffer, length: consumed };
-    }
-  } catch {
-    // Fall through to the searching variant.
-  }
-  const length = inflatedLength(pack, offset, end);
-  return { data: inflateSync(pack.subarray(offset, offset + length)), length };
+// ---------------------------------------------------------------- pkt-lines
+
+export const PKT_LINE_MAX = 65520;
+
+export type PktKind = 'data' | 'flush' | 'delim' | 'response-end';
+
+export interface PktLine {
+  readonly kind: PktKind;
+  readonly payload: Buffer;
 }
 
-interface RawPackEntry {
-  readonly offset: number;
-  readonly typeId: number;
-  readonly data: Buffer;
-  readonly baseOid?: string;
-  readonly baseOffset?: number;
-}
-
-export interface PackReadResult {
-  readonly objects: Map<string, GitObject>;
-  readonly count: number;
-}
-
-/**
- * Read a whole packfile into an object map. Deltas resolve against the pack itself first, then
- * against `resolveBase` (a thin pack's external bases). Throws on any structural problem.
- */
-export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject | undefined): PackReadResult {
-  if (pack.length < 12 + 20 || pack.subarray(0, 4).toString('ascii') !== 'PACK') {
-    throw new Error('not a packfile');
-  }
-  const version = pack.readUInt32BE(4);
-  if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
-  const count = pack.readUInt32BE(8);
-  const end = pack.length - 20;
-  const trailer = pack.subarray(end).toString('hex');
-  const checksum = createHash('sha1').update(pack.subarray(0, end)).digest('hex');
-  if (trailer !== checksum) throw new Error('pack checksum mismatch');
-  const raw: RawPackEntry[] = [];
-  let offset = 12;
-  for (let index = 0; index < count; index += 1) {
-    const objectStart = offset;
-    let byte = pack[offset];
-    offset += 1;
-    const typeId = (byte >> 4) & 0x07;
-    let size = byte & 0x0f;
-    let shift = 4;
-    while (byte & 0x80) {
-      byte = pack[offset];
-      offset += 1;
-      size |= (byte & 0x7f) << shift;
-      shift += 7;
-    }
-    let baseOid: string | undefined;
-    let baseOffset: number | undefined;
-    if (typeId === 6) {
-      // ofs-delta: a negative offset encoded one byte at a time, each step adding one.
-      let back = pack[offset];
-      offset += 1;
-      let value = back & 0x7f;
-      while (back & 0x80) {
-        back = pack[offset];
-        offset += 1;
-        value = ((value + 1) << 7) | (back & 0x7f);
-      }
-      baseOffset = objectStart - value;
-    } else if (typeId === 7) {
-      baseOid = pack.subarray(offset, offset + 20).toString('hex');
-      offset += 20;
-    } else if (typeId < 1 || typeId > 4) {
-      throw new Error(`unknown pack object type ${typeId}`);
-    }
-    const { data, length } = inflateExact(pack, offset, end);
-    if (data.length !== size) throw new Error(`pack object size ${data.length} != header ${size}`);
-    offset += length;
-    raw.push({ offset: objectStart, typeId, data, baseOid, baseOffset });
-  }
-  const objects = new Map<string, GitObject>();
-  const resolvedByOffset = new Map<number, GitObject>();
-  const pending: RawPackEntry[] = [];
-  for (const entry of raw) {
-    if (entry.typeId >= 1 && entry.typeId <= 4) {
-      const type = ID_TYPES[entry.typeId] as GitObjectType;
-      const object: GitObject = { type, data: entry.data };
-      objects.set(hashObject(type, entry.data), object);
-      resolvedByOffset.set(entry.offset, object);
-    } else {
-      pending.push(entry);
-    }
-  }
-  let remaining = pending;
-  let guard = 0;
-  while (remaining.length > 0) {
-    guard += 1;
-    if (guard > count + 2) throw new Error('delta chain does not resolve');
-    const next: RawPackEntry[] = [];
-    let progressed = false;
-    for (const entry of remaining) {
-      let base: GitObject | undefined;
-      if (entry.typeId === 7) {
-        base = objects.get(entry.baseOid!) ?? resolveBase?.(entry.baseOid!);
-      } else {
-        base = resolvedByOffset.get(entry.baseOffset!);
-      }
-      if (!base) {
-        next.push(entry);
-        continue;
-      }
-      const data = applyDelta(base.data, entry.data);
-      const object: GitObject = { type: base.type, data };
-      objects.set(hashObject(object.type, data), object);
-      resolvedByOffset.set(entry.offset, object);
-      progressed = true;
-    }
-    if (!progressed && next.length === remaining.length) throw new Error('delta base missing');
-    remaining = next;
-  }
-  return { objects, count };
-}
-
-// ------------------------------------------------------------------ pkt-line
-
-/** Encode one pkt-line (4-hex length prefix including itself). */
-export function pktLine(payload: string | Uint8Array): Buffer {
+export function encodePktLine(payload: string | Uint8Array): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : Buffer.from(payload);
-  const length = data.length + 4;
-  if (length > 65520) throw new Error('pkt-line too long');
-  const head = Buffer.from(length.toString(16).padStart(4, '0'), 'ascii');
-  return Buffer.concat([head, data]);
+  if (data.length > PKT_LINE_MAX - 4) throw new Error(`pkt-line payload is ${data.length} bytes, over the maximum`);
+  const header = Buffer.allocUnsafe(4);
+  header.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  return Buffer.concat([header, data]);
 }
-export const PKT_DELIM = Buffer.from('0001', 'ascii');
-export const PKT_RESPONSE_END = Buffer.from('0002', 'ascii');
 
-export type PktPacket =
-  | { readonly kind: 'data'; readonly payload: Buffer }
-  | { readonly kind: 'flush' }
-  | { readonly kind: 'delim' }
-  | { readonly kind: 'response-end' };
+export function pktFlush(): Buffer {
+  return Buffer.from('0000', 'ascii');
+}
 
-/** Decode pkt-lines from `start` until the buffer runs out; throws on malformed framing. */
-export function decodePktLines(bytes: Buffer, start = 0): { packets: PktPacket[]; next: number } {
-  const packets: PktPacket[] = [];
-  let offset = start;
-  while (offset < bytes.length) {
-    if (offset + 4 > bytes.length) throw new Error('truncated pkt-line header');
-    const head = bytes.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) throw new Error(`bad pkt-line length ${JSON.stringify(head)}`);
-    const length = parseInt(head, 16);
+export function pktDelim(): Buffer {
+  return Buffer.from('0001', 'ascii');
+}
+
+/** Encode a mixed sequence; 'flush'/'delim' are the control packets. */
+export function encodePktLines(items: ReadonlyArray<string | Uint8Array | 'flush' | 'delim'>): Buffer {
+  const parts: Buffer[] = [];
+  for (const item of items) {
+    if (item === 'flush') parts.push(pktFlush());
+    else if (item === 'delim') parts.push(pktDelim());
+    else parts.push(encodePktLine(item));
+  }
+  return Buffer.concat(parts);
+}
+
+const HEX4 = /^[0-9a-fA-F]{4}$/;
+
+/** Decode a complete buffer into pkt-lines; throws on malformed framing. */
+export function decodePktLines(bytes: Uint8Array): PktLine[] {
+  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  const packets: PktLine[] = [];
+  let offset = 0;
+  while (offset < buffer.length) {
+    if (offset + 4 > buffer.length) throw new Error(`truncated pkt-line: ${buffer.length - offset} trailing byte(s)`);
+    const head = buffer.subarray(offset, offset + 4).toString('ascii');
+    if (!HEX4.test(head)) throw new Error(`invalid pkt-line length ${JSON.stringify(head)}`);
+    const length = Number.parseInt(head, 16);
     if (length === 0) {
-      packets.push({ kind: 'flush' });
+      packets.push({ kind: 'flush', payload: Buffer.alloc(0) });
       offset += 4;
     } else if (length === 1) {
-      packets.push({ kind: 'delim' });
+      packets.push({ kind: 'delim', payload: Buffer.alloc(0) });
       offset += 4;
     } else if (length === 2) {
-      packets.push({ kind: 'response-end' });
+      packets.push({ kind: 'response-end', payload: Buffer.alloc(0) });
       offset += 4;
-    } else if (length < 4) {
-      throw new Error(`pkt-line length ${length} is reserved`);
+    } else if (length === 3) {
+      throw new Error('invalid pkt-line length 0003');
     } else {
-      if (offset + length > bytes.length) throw new Error('truncated pkt-line payload');
-      packets.push({ kind: 'data', payload: Buffer.from(bytes.subarray(offset + 4, offset + length)) });
+      if (length > PKT_LINE_MAX) throw new Error(`pkt-line length ${length} exceeds ${PKT_LINE_MAX}`);
+      if (offset + length > buffer.length) {
+        throw new Error(`truncated pkt-line: ${length} announced, ${buffer.length - offset} available`);
+      }
+      packets.push({ kind: 'data', payload: buffer.subarray(offset + 4, offset + length) });
       offset += length;
     }
   }
-  return { packets, next: offset };
+  return packets;
 }
 
-/** Frame pack bytes as sideband band-1 pkt-lines of at most 32 KiB of payload each. */
-export function sidebandFrame(pack: Buffer): Buffer {
+/** Split decoded packets into their data lines as text (control packets dropped). */
+export function pktLinesToStrings(packets: readonly PktLine[]): string[] {
+  const lines: string[] = [];
+  for (const packet of packets) {
+    if (packet.kind === 'data') lines.push(packet.payload.toString('utf8'));
+  }
+  return lines;
+}
+
+/** Wrap bytes in sideband band-1 packets (each chunk a pkt-line starting with 0x01).
+ *  A pkt-line holds at most 65520 bytes total, so a band-1 chunk carries at
+ *  most 65515 data bytes (1 band byte + 65515 = 65516 payload). */
+export function sidebandPackets(data: Buffer, chunkSize = 65515): Buffer {
   const parts: Buffer[] = [];
-  const CHUNK = 32768;
-  for (let offset = 0; offset < pack.length; offset += CHUNK) {
-    const slice = pack.subarray(offset, Math.min(pack.length, offset + CHUNK));
-    parts.push(pktLine(Buffer.concat([Buffer.from([1]), slice])));
+  if (data.length === 0) return Buffer.alloc(0);
+  for (let offset = 0; offset < data.length; offset += chunkSize) {
+    const chunk = data.subarray(offset, Math.min(data.length, offset + chunkSize));
+    parts.push(encodePktLine(Buffer.concat([Buffer.from([1]), chunk])));
   }
   return Buffer.concat(parts);
 }
