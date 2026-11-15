@@ -240,17 +240,10 @@ function fetchV2(repo: Repo, lines: readonly string[]): Buffer {
     else if (line === 'done') done = true;
   }
   const request: FetchRequest = { wants, haves, shallowLines, deepen, done, noProgress: lines.includes('no-progress') };
-  const out: Buffer[] = [];
-  const haveCommits = new Set<string>();
-  for (const have of haves) {
-    const commit = repo.peelToCommit(have);
-    if (commit) haveCommits.add(commit);
-  }
-  const anyCommon = haves.some((have) => haveCommits.has(repo.peelToCommit(have) ?? ''));
-  out.push(pktLine('acknowledgments\n'));
   if (!done) {
     // Negotiation round: acknowledge the common haves the client named, nothing more.
     const acked = new Set<string>();
+    const out: Buffer[] = [pktLine('acknowledgments\n')];
     for (const have of haves) {
       const commit = repo.peelToCommit(have);
       if (commit && !acked.has(commit)) {
@@ -262,24 +255,24 @@ function fetchV2(repo: Repo, lines: readonly string[]): Buffer {
     out.push(Buffer.from('0000'));
     return Buffer.concat(out);
   }
-  for (const have of haves) {
-    const commit = repo.peelToCommit(have);
-    if (commit) out.push(pktLine(`ACK ${commit}\n`));
-  }
-  if (!anyCommon && haves.length > 0) out.push(pktLine('NAK\n'));
-  out.push(pktLine('ready\n'));
-  out.push(Buffer.from('0001'));
+  // A done request is answered the way git answers it: no acknowledgments section, just the
+  // shallow bookkeeping (when the depth changed) and the packfile, delim-separated.
   const { pack, shallow, unshallow } = selectFetchObjects(repo, request);
+  const sections: Buffer[] = [];
   if (shallow.length > 0 || unshallow.length > 0 || deepen !== undefined) {
-    out.push(pktLine('shallow-info\n'));
-    for (const oid of shallow) out.push(pktLine(`shallow ${oid}\n`));
-    for (const oid of unshallow) out.push(pktLine(`unshallow ${oid}\n`));
-    out.push(Buffer.from('0001'));
+    const info: Buffer[] = [pktLine('shallow-info\n')];
+    for (const oid of shallow) info.push(pktLine(`shallow ${oid}\n`));
+    for (const oid of unshallow) info.push(pktLine(`unshallow ${oid}\n`));
+    sections.push(Buffer.concat(info));
   }
   if (pack.length > 0) {
-    out.push(pktLine('packfile\n'));
-    out.push(sidebandFrame(pack));
+    sections.push(Buffer.concat([pktLine('packfile\n'), sidebandFrame(pack)]));
   }
+  const out: Buffer[] = [];
+  sections.forEach((section, index) => {
+    if (index > 0) out.push(Buffer.from('0001'));
+    out.push(section);
+  });
   out.push(Buffer.from('0000'));
   return Buffer.concat(out);
 }
