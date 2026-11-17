@@ -362,16 +362,47 @@ export function parseTree(data: Buffer): TreeEntry[] {
 
 // ---- closure / fetch ----
 
-export function objectClosure(repo: Repo, roots: string[], exclude: string[], maxDepth?: number): Set<string> {
+export function objectClosure(repo: Repo, roots: string[], exclude: string[], maxDepth?: number, stopAt?: string[]): Set<string> {
   const excluded = new Set<string>();
   if (exclude.length > 0) {
-    // full closure of the exclude roots (no depth limit: haves are fully held)
-    collect(repo, exclude, excluded, undefined);
+    // When the client sent shallow boundaries, a held boundary commit is
+    // held WITHOUT its history: walk from each have but stop descending at
+    // a boundary commit (the boundary itself and its tree/blobs are held,
+    // its ancestors are not).
+    if (stopAt && stopAt.length > 0) collectHeld(repo, exclude, new Set(stopAt), excluded);
+    else collect(repo, exclude, excluded, undefined);
   }
   const out = new Set<string>();
   collect(repo, roots, out, maxDepth);
   for (const oid of excluded) out.delete(oid);
   return out;
+}
+
+// Walk the held set from the client's haves, stopping at shallow-boundary
+// commits: the boundary commit and its tree/blobs are held, its parents
+// (and their closures) are not.
+function collectHeld(repo: Repo, roots: string[], stopAt: Set<string>, out: Set<string>): void {
+  const queue = [...roots];
+  const seen = new Set<string>();
+  while (queue.length > 0) {
+    const oid = queue.shift()!;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const obj = repo.objects.get(oid);
+    if (!obj) continue;
+    if (obj.type === 'commit') {
+      out.add(oid);
+      const commit = parseCommit(obj.data);
+      if (commit.tree) collectTree(repo, commit.tree, out);
+      if (!stopAt.has(oid)) for (const p of commit.parents) queue.push(p);
+    } else if (obj.type === 'tree') {
+      collectTree(repo, oid, out);
+    } else if (obj.type === 'tag') {
+      out.add(oid);
+      const m = /^object ([0-9a-f]{40})/m.exec(obj.data.toString('utf8'));
+      if (m) queue.push(m[1]);
+    }
+  }
 }
 
 function collect(repo: Repo, roots: string[], out: Set<string>, maxDepth: number | undefined): void {
@@ -392,8 +423,11 @@ function collect(repo: Repo, roots: string[], out: Set<string>, maxDepth: number
         out.add(oid);
         if (obj.type === 'tree') collectTree(repo, oid, out);
         else if (obj.type === 'tag') {
+          // A tag peels to its target at the SAME generation: pass the
+          // remaining depth budget so a tag want at depth d does not pull
+          // history beyond maxDepth.
           const m = /^object ([0-9a-f]{40})/m.exec(obj.data.toString('utf8'));
-          if (m) collect(repo, [m[1]], out, undefined);
+          if (m) collect(repo, [m[1]], out, maxDepth === undefined ? undefined : maxDepth - depth);
         }
       }
       continue;

@@ -89,8 +89,8 @@ function sideband(pack: Buffer): Buffer[] {
   return out;
 }
 
-function packForClosure(repo: Repo, wants: string[], haves: string[], maxDepth?: number): Buffer {
-  const closure = objectClosure(repo, wants, haves, maxDepth);
+function packForClosure(repo: Repo, wants: string[], haves: string[], maxDepth?: number, shallow?: string[]): Buffer {
+  const closure = objectClosure(repo, wants, haves, maxDepth, shallow);
   const objects: Array<{ type: string; data: Buffer }> = [];
   for (const oid of [...closure].sort()) {
     const obj = repo.objects.get(oid);
@@ -105,15 +105,38 @@ function commitParents(repo: Repo, oid: string): string[] {
   return parseCommit(obj.data).parents;
 }
 
-// BFS generation depths from the want roots (depth 0 = the wants). Returns
-// the shallow boundary (commits at depth-1 with parents) and the set of
-// commits inside the closure (depth < depth).
+// Follow a tag object chain to its target commit (a ref pointing directly
+// at a commit peels to itself). Used for ls-refs `peeled:` values.
+function peelToCommit(repo: Repo, oid: string): string {
+  let cur = oid;
+  for (let i = 0; i < 16; i++) {
+    const obj = repo.objects.get(cur);
+    if (!obj || obj.type !== 'tag') return cur;
+    const m = /^object ([0-9a-f]{40})/m.exec(obj.data.toString('utf8'));
+    if (!m) return cur;
+    cur = m[1];
+  }
+  return cur;
+}
+
+// BFS generation depths from the want roots (depth 0 = the wants). Tag
+// wants peel to their target commit at the same depth. Returns the shallow
+// boundary (commits at depth-1 with parents) and the set of commits inside
+// the closure (depth < depth).
 function shallowBoundary(repo: Repo, wants: string[], depth: number): { boundary: string[]; inside: Set<string> } {
   const depths = new Map<string, number>();
   const queue: Array<[string, number]> = wants.map((w) => [w, 0] as [string, number]);
   const boundary: string[] = [];
   while (queue.length > 0) {
-    const [oid, d] = queue.shift()!;
+    let [oid, d] = queue.shift()!;
+    // Peel tag objects to their target commit without consuming a generation.
+    for (let i = 0; i < 16; i++) {
+      const obj = repo.objects.get(oid);
+      if (!obj || obj.type !== 'tag') break;
+      const m = /^object ([0-9a-f]{40})/m.exec(obj.data.toString('utf8'));
+      if (!m) break;
+      oid = m[1];
+    }
     if (d >= depth || depths.has(oid)) continue;
     depths.set(oid, d);
     const parents = commitParents(repo, oid);
@@ -190,8 +213,8 @@ export function createGitHandlers(store: Store, token: string): (req: IncomingMe
         // the first line, one '<oid> <ref>' per ref, flush. Empty repo:
         // '<zero> capabilities^{}' carries the capabilities instead.
         const caps = service === 'git-upload-pack'
-          ? `multi_ack thin-pack side-band side-band-64k ofs-delta shallow no-progress include-tag multi_ack_detailed agent=coreforge/1.0 symref=HEAD:${repo.head}`
-          : 'report-status delete-refs quiet ofs-delta agent=coreforge/1.0';
+          ? `multi_ack thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not deepen-relative no-progress include-tag multi_ack_detailed agent=coreforge/1.0 symref=HEAD:${repo.head}`
+          : 'report-status side-band-64k delete-refs quiet ofs-delta agent=coreforge/1.0';
         const parts: Buffer[] = [];
         parts.push(pktLine(`# service=${service}\n`), flushPkt());
         const headOid = store.resolveRef(repo, 'HEAD');
@@ -241,7 +264,7 @@ export function createGitHandlers(store: Store, token: string): (req: IncomingMe
             if (keep('HEAD')) {
               let line = `${headOid} HEAD`;
               if (symrefs) line += ` symref-target:${repo.head}`;
-              if (peel) line += ` peeled:${headOid}`;
+              if (peel) line += ` peeled:${peelToCommit(repo, headOid)}`;
               out.push(pktLine(`${line}\n`));
             }
           } else if (unborn && keep('HEAD')) {
@@ -252,7 +275,7 @@ export function createGitHandlers(store: Store, token: string): (req: IncomingMe
           for (const { ref, oid } of store.listRefs(repo)) {
             if (!keep(ref)) continue;
             let line = `${oid} ${ref}`;
-            if (peel) line += ` peeled:${oid}`;
+            if (peel) line += ` peeled:${peelToCommit(repo, oid)}`;
             out.push(pktLine(`${line}\n`));
           }
           out.push(flushPkt());
@@ -283,31 +306,57 @@ export function createGitHandlers(store: Store, token: string): (req: IncomingMe
           if (!done) {
             const out: Buffer[] = [];
             if (isV0) {
-              out.push(pktLine('NAK\n'));
+              // v0 shallow: the shallow/unshallow lines travel in this first
+              // (acknowledgment-phase) response, terminated by a FLUSH —
+              // the client expects the flush here, NOT a NAK (the NAK comes
+              // only in the `done` response, after a second shallow section).
+              if (deepen !== null) {
+                const { boundary, inside } = shallowBoundary(repo, wants, deepen);
+                for (const b of boundary) out.push(pktLine(`shallow ${b}\n`));
+                for (const s of shallowReq) {
+                  if (boundary.includes(s)) continue;
+                  if (inside.has(s) && commitParents(repo, s).length > 0) out.push(pktLine(`unshallow ${s}\n`));
+                }
+                out.push(flushPkt());
+              } else {
+                out.push(pktLine('NAK\n'));
+                out.push(flushPkt());
+              }
             } else {
               out.push(pktLine('acknowledgments\n'));
               const acks: string[] = [];
               for (const have of haves) {
                 if (!repo.objects.has(have)) continue;
-                if (wants.some((w) => store.isAncestor(repo, have, w))) acks.push(have);
+                // Peel tag wants: a have equal to a tag's target commit is common.
+                if (wants.some((w) => store.isAncestor(repo, have, peelToCommit(repo, w)))) acks.push(have);
               }
               if (acks.length === 0) out.push(pktLine('NAK\n'));
               else for (const a of acks) out.push(pktLine(`ACK ${a}\n`));
+              out.push(flushPkt());
             }
-            out.push(flushPkt());
             res.end(Buffer.concat(out));
             return true;
           }
 
           // done: NO acknowledgments section; straight to shallow-info / packfile.
+          // The done request may omit haves (protocol v2 sends them only in
+          // the negotiation request), so the held set is haves ∪ the client's
+          // shallow boundaries — the boundaries are held commits themselves.
+          const held = [...new Set([...haves, ...shallowReq])];
           const out: Buffer[] = [];
           if (isV0) {
             if (deepen !== null) {
-              const { boundary } = shallowBoundary(repo, wants, deepen);
+              const { boundary, inside } = shallowBoundary(repo, wants, deepen);
               for (const b of boundary) out.push(pktLine(`shallow ${b}\n`));
+              for (const s of shallowReq) {
+                if (boundary.includes(s)) continue;
+                if (inside.has(s) && commitParents(repo, s).length > 0) out.push(pktLine(`unshallow ${s}\n`));
+              }
+              // Flush ends the shallow section; NAK + pack follow.
+              out.push(flushPkt());
             }
             out.push(pktLine('NAK\n'));
-            const pack = packForClosure(repo, wants, haves, deepen ?? undefined);
+            const pack = packForClosure(repo, wants, held, deepen ?? undefined, shallowReq);
             out.push(...sideband(pack));
             out.push(flushPkt());
             res.end(Buffer.concat(out));
@@ -335,7 +384,7 @@ export function createGitHandlers(store: Store, token: string): (req: IncomingMe
             out.push(flushPkt());
           }
           out.push(pktLine('packfile\n'));
-          const pack = packForClosure(repo, wants, haves, deepen ?? undefined);
+          const pack = packForClosure(repo, wants, held, deepen ?? undefined, shallowReq);
           out.push(...sideband(pack));
           out.push(flushPkt());
           res.end(Buffer.concat(out));
