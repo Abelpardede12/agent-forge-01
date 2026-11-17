@@ -111,7 +111,10 @@ export function createStore() {
     const text = data.toString('utf8');
     const split = text.indexOf('\n\n');
     const header = split === -1 ? text : text.slice(0, split);
-    const message = split === -1 ? '' : text.slice(split + 2);
+    let message = split === -1 ? '' : text.slice(split + 2);
+    // buildCommit appends a framing newline to the object body; the
+    // API-facing message must not carry it (real GitHub strips it too).
+    if (message.endsWith('\n')) message = message.slice(0, -1);
     let tree = '';
     const parents: string[] = [];
     let author: Author = { name: '', email: '', epoch: 0 };
