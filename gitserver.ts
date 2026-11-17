@@ -459,13 +459,19 @@ export function createGitHandlers(store: Store, token: string): (req: IncomingMe
           store.setRef(repo, cmd.ref, cmd.new);
           results.push({ ref: cmd.ref, ok: true });
         }
-        const out: Buffer[] = [];
-        if (unpackError) out.push(pktLine(`unpack ${unpackError}\n`));
-        else out.push(pktLine('unpack ok\n'));
+        // Report-status inside side-band-64k band 1: the whole report stream
+        // (one inner pkt-line per line, terminated by an INNER flush) is the
+        // band-1 data, chunked into sideband packets; a single OUTER flush
+        // then ends the response. Without the inner flush the client's
+        // report parser hits EOF mid-stream ("remote end hung up").
+        const report: Buffer[] = [];
+        if (unpackError) report.push(pktLine(`unpack ${unpackError}\n`));
+        else report.push(pktLine('unpack ok\n'));
         for (const r of results) {
-          out.push(pktLine(r.ok ? `ok ${r.ref}\n` : `ng ${r.ref} ${r.reason ?? 'failed'}\n`));
+          report.push(pktLine(r.ok ? `ok ${r.ref}\n` : `ng ${r.ref} ${r.reason ?? 'failed'}\n`));
         }
-        out.push(flushPkt());
+        report.push(flushPkt());
+        const out: Buffer[] = [...sideband(Buffer.concat(report)), flushPkt()];
         res.writeHead(200, { 'Content-Type': 'application/x-git-receive-pack-result' });
         res.end(Buffer.concat(out));
         return true;
